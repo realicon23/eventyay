@@ -35,7 +35,7 @@
 				.ticket-info(@click.stop="")
 					template(v-if="user.order_code && eventRouting.organizer && eventRouting.event")
 						a.order-link(
-							:href="`/control/${eventRouting.organizer}/${eventRouting.event}/orders/${user.order_code}/`",
+							:href="`/control/event/${encodeURIComponent(eventRouting.organizer)}/${encodeURIComponent(eventRouting.event)}/orders/${encodeURIComponent(user.order_code)}/`",
 							target="_blank",
 							rel="noopener noreferrer",
 							:title="user.order_code",
@@ -48,14 +48,6 @@
 				.state {{ user.moderation_state || '–' }}
 				.row-actions(v-if="user.id !== ownUser.id", @click.stop="")
 					bunt-button.btn-open-dm(v-if="hasPermission('world:chat.direct')", @click="$store.dispatch('chat/openDirectMessage', {users: [user]})") message
-					bunt-button.btn-reactivate(
-						v-if="hasPermission('world:users.manage') && user.moderation_state",
-						:key="`${user.id}-reactivate`",
-						:loading="user.updating === 'reactivate'",
-						:error-message="(user.error && user.error.action === 'reactivate') ? user.error.message : null",
-						tooltipPlacement="left",
-						@click="doAction(user, 'reactivate', null)")
-						| {{ user.moderation_state === 'banned' ? 'unban' : 'unsilence'}}
 					bunt-button.btn-ban(
 						v-if="hasPermission('world:users.manage') && user.moderation_state !== 'banned'",
 						:key="`${user.id}-ban`",
@@ -72,6 +64,14 @@
 						tooltipPlacement="left",
 						@click="doAction(user, 'silence', 'silenced')")
 						| silence
+					bunt-button.btn-reactivate(
+						v-if="hasPermission('world:users.manage') && user.moderation_state",
+						:key="`${user.id}-reactivate`",
+						:loading="user.updating === 'reactivate'",
+						:error-message="(user.error && user.error.action === 'reactivate') ? user.error.message : null",
+						tooltipPlacement="left",
+						@click="doAction(user, 'reactivate', null)")
+						| {{ user.moderation_state === 'banned' ? 'unban' : 'unsilence'}}
 		bunt-progress-circular(v-else, size="huge", :page="true")
 </template>
 <script>

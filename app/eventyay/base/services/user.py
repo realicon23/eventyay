@@ -1,18 +1,14 @@
-import datetime as dt
-import json
 import operator
 from collections import namedtuple
 from datetime import timedelta
 from functools import reduce
 
-import jwt
-import requests
 from channels.db import database_sync_to_async
 from channels.layers import get_channel_layer
+from django.core.cache import cache
 from django.core.paginator import InvalidPage, Paginator
 from django.db.models import Q
 from django.db.transaction import atomic
-from django.shortcuts import get_object_or_404
 from django.utils.timezone import now
 from django_scopes import scopes_disabled
 
@@ -21,7 +17,7 @@ from eventyay.features.live.channels import GROUP_USER
 from eventyay.base.models import AuditLog
 from eventyay.base.models.auth import User
 from eventyay.base.models.room import AnonymousInvite
-from eventyay.base.models.event import Event, EventView
+from eventyay.base.models.event import EventView
 from eventyay.base.models.orders import Order, OrderPosition
 from eventyay.core.permissions import Permission
 
@@ -71,30 +67,19 @@ def resolve_wikimedia_usernames_by_email(emails):
     uniq = list(dict.fromkeys((e or "").strip().lower() for e in emails if e))
     if not uniq:
         return {}
-    rows = (
-        User.objects.filter(event__isnull=True, email__in=uniq)
-        .exclude(wikimedia_username__isnull=True)
-        .exclude(wikimedia_username__exact="")
-        .values("email", "wikimedia_username")
-    )
+    with scopes_disabled():
+        rows = list(
+            User.objects.filter(event__isnull=True, email__in=uniq)
+            .exclude(wikimedia_username__isnull=True)
+            .exclude(wikimedia_username__exact="")
+            .values("email", "wikimedia_username")
+        )
     result = {}
     for row in rows:
         email = (row.get("email") or "").strip().lower()
         if email and email not in result:
             result[email] = (row.get("wikimedia_username") or "").strip()
     return result
-
-
-def admin_public_fields_with_email_fallback(
-    user_row, ticket_by_token, email_to_wikimedia
-):
-    data = admin_public_fields_from_user_row(user_row, ticket_by_token)
-    if data.get("wikimedia_username"):
-        return data
-    email = (data.get("email") or "").strip().lower()
-    if email and email in email_to_wikimedia:
-        data["wikimedia_username"] = email_to_wikimedia[email]
-    return data
 
 
 def build_admin_ticket_rows_by_token(event_id, token_ids):
@@ -129,23 +114,45 @@ def build_admin_ticket_rows_by_token(event_id, token_ids):
             }
     need_hash = [t for t in uniq if t not in result and _is_email_hash_uid_token(t)]
     if need_hash:
-        need_set = {t.upper() for t in need_hash}
+        need_hash_upper = {t.upper() for t in need_hash}
         hash_to_email = {}
-        with scopes_disabled():
-            for email in (
-                Order.objects.filter(event_id=event_id)
-                .filter(status=Order.STATUS_PAID)
-                .exclude(email__isnull=True)
-                .exclude(email__exact="")
-                .values_list("email", flat=True)
-                .iterator(chunk_size=4000)
-            ):
-                h = encode_email(email).upper()
-                if h in need_set and h not in hash_to_email:
-                    hash_to_email[h] = email
-                if len(hash_to_email) >= len(need_set):
-                    break
-        emails = list(dict.fromkeys(hash_to_email.values()))
+
+        # Satisfy as many tokens as possible from the per-token cache.
+        # Each entry is small (one email string) and stable — a token_id derived
+        # from encode_email(email) never changes for a given address.
+        uncached = set()
+        for h in need_hash_upper:
+            val = cache.get(f'video:email_hash:{event_id}:{h}')
+            if val is not None:
+                hash_to_email[h] = val
+            else:
+                uncached.add(h)
+
+        # Stream DB only for tokens that were not in cache.
+        if uncached:
+            with scopes_disabled():
+                for email in (
+                    Order.objects.filter(event_id=event_id)
+                    .filter(status=Order.STATUS_PAID)
+                    .exclude(email__isnull=True)
+                    .exclude(email__exact="")
+                    .values_list('email', flat=True)
+                    .iterator(chunk_size=2000)
+                ):
+                    h = encode_email(email).upper()
+                    if h in uncached and h not in hash_to_email:
+                        hash_to_email[h] = email
+                        cache.set(f'video:email_hash:{event_id}:{h}', email, 1800)
+                        uncached.discard(h)
+                        if not uncached:
+                            break
+
+        resolved = [
+            hash_to_email[t.upper()]
+            for t in need_hash
+            if t.upper() in hash_to_email
+        ]
+        emails = list(dict.fromkeys(resolved))
         positions_by_email = {}
         if emails:
             with scopes_disabled():
@@ -272,26 +279,25 @@ def get_public_users(
     else:
         users_data = qs.values(*value_fields).iterator()
 
-    ticket_by_token = {}
-    email_to_wikimedia = {}
+    admin_fields_by_id = {}
     if include_admin_info and users_data:
+        ticket_by_token = {}
         token_ids = [u["token_id"] for u in users_data if u["token_id"]]
         if token_ids:
             ticket_by_token = build_admin_ticket_rows_by_token(event_id, token_ids)
-        admin_rows = [
-            admin_public_fields_from_user_row(u, ticket_by_token)
-            for u in users_data
-        ]
-        emails_to_resolve = [
-            row["email"]
-            for row in admin_rows
-            if row.get("email") and not row.get("wikimedia_username")
-        ]
+        emails_to_resolve = []
+        for u in users_data:
+            fields = admin_public_fields_from_user_row(u, ticket_by_token)
+            admin_fields_by_id[u["id"]] = fields
+            if fields.get("email") and not fields.get("wikimedia_username"):
+                emails_to_resolve.append(fields["email"])
         if emails_to_resolve:
-            with scopes_disabled():
-                email_to_wikimedia = resolve_wikimedia_usernames_by_email(
-                    emails_to_resolve
-                )
+            email_to_wikimedia = resolve_wikimedia_usernames_by_email(emails_to_resolve)
+            for fields in admin_fields_by_id.values():
+                if not fields.get("wikimedia_username"):
+                    email = (fields.get("email") or "").strip().lower()
+                    if email and email in email_to_wikimedia:
+                        fields["wikimedia_username"] = email_to_wikimedia[email]
 
     return [
         dict(
@@ -321,11 +327,7 @@ def get_public_users(
                 else {}
             ),
             **(
-                admin_public_fields_with_email_fallback(
-                    u,
-                    ticket_by_token,
-                    email_to_wikimedia,
-                )
+                admin_fields_by_id.get(u["id"], {})
                 if include_admin_info
                 else {}
             ),
@@ -793,41 +795,47 @@ def list_users(
         qs = qs.filter(reduce(operator.or_, conditions))
 
     try:
-        p = Paginator(
-            qs.order_by("profile__display_name").values(
-                "id",
-                "profile",
-                "traits",
-                "last_login",
-                "moderation_state",
-                "token_id",
-                "pretalx_id",
+        value_fields = (
+            "id",
+            "profile",
+            "traits",
+            "last_login",
+            "moderation_state",
+            "token_id",
+            "pretalx_id",
+        )
+        if include_admin_info:
+            qs_values = qs.order_by("profile__display_name").values(
+                *value_fields,
                 "email",
                 "wikimedia_username",
-            ),
+            )
+        else:
+            qs_values = qs.order_by("profile__display_name").values(*value_fields)
+        p = Paginator(
+            qs_values,
             page_size,
         ).page(page)
         ticket_by_token = {}
+        email_to_wikimedia = {}
+        admin_fields_by_id = {}
         if include_admin_info and p.object_list:
             tids = [u["token_id"] for u in p.object_list if u.get("token_id")]
             if tids:
                 ticket_by_token = build_admin_ticket_rows_by_token(event_id, tids)
-        email_to_wikimedia = {}
-        if include_admin_info and p.object_list:
-            admin_rows = [
-                admin_public_fields_from_user_row(u, ticket_by_token)
-                for u in p.object_list
-            ]
-            emails_to_resolve = [
-                row["email"]
-                for row in admin_rows
-                if row.get("email") and not row.get("wikimedia_username")
-            ]
+            emails_to_resolve = []
+            for u in p.object_list:
+                fields = admin_public_fields_from_user_row(u, ticket_by_token)
+                admin_fields_by_id[u["id"]] = fields
+                if fields.get("email") and not fields.get("wikimedia_username"):
+                    emails_to_resolve.append(fields["email"])
             if emails_to_resolve:
-                with scopes_disabled():
-                    email_to_wikimedia = resolve_wikimedia_usernames_by_email(
-                        emails_to_resolve
-                    )
+                email_to_wikimedia = resolve_wikimedia_usernames_by_email(emails_to_resolve)
+                for fields in admin_fields_by_id.values():
+                    if not fields.get("wikimedia_username"):
+                        email = (fields.get("email") or "").strip().lower()
+                        if email and email in email_to_wikimedia:
+                            fields["wikimedia_username"] = email_to_wikimedia[email]
         return {
             "results": sorted(
                 (
@@ -851,11 +859,7 @@ def list_users(
                             else []
                         ),
                         **(
-                            admin_public_fields_with_email_fallback(
-                                u,
-                                ticket_by_token,
-                                email_to_wikimedia,
-                            )
+                            admin_fields_by_id.get(u["id"], {})
                             if include_admin_info
                             else {}
                         ),
